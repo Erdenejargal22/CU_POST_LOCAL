@@ -2,6 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef } from "react";
 import { DEMO, initialParcels, randomCode, randomTicket, randomTracking, type Parcel } from "./demo";
+import { openLockerDoorHardware, subscribeHardwareEvents } from "./hardwareBridge";
 import { translate, type Lang, type TKey } from "./i18n";
 import { DOOR_BY_ID, DOORS, SIZES, type Size } from "./locker";
 
@@ -118,7 +119,6 @@ const withToast = (s: State, key: TKey, tone: ToastTone, vars?: Record<string, s
   toast: { id: toastSeq++, key, tone, vars },
 });
 
-/** Doors that currently hold a parcel or are open (so a courier can't use them). */
 function busyDoors(s: State): Set<string> {
   const busy = new Set<string>(s.openDoors);
   for (const p of s.parcels) if (p.status === "stored" && p.doorId) busy.add(p.doorId);
@@ -158,9 +158,7 @@ function finishPickup(s: State): State {
   };
 }
 
-/** Back to the attract screen and forget everything about the last person. */
 function resetSession(s: State): State {
-  // Doors left open are closed; parcels nobody confirmed stay in the locker (so demo codes keep working).
   return {
     ...s,
     screen: "attract",
@@ -240,7 +238,6 @@ function reducer(s: State, a: Action): State {
       return { ...s, codeError: null, codeValue: "", attemptsLeft: DEMO.maxAttempts, lockedUntil: null };
 
     case "closeDoor": {
-      // Simulated door sensor: a door was closed.
       if (s.pickup && s.pickup.doorIds.includes(a.doorId)) {
         const closed = [...new Set([...s.pickup.closed, a.doorId])];
         const next: State = {
@@ -362,20 +359,78 @@ function useKioskStore() {
     ref.current = state;
   }, [state]);
 
+  const lastScanRef = useRef<{ code: string; at: number }>({ code: "", at: 0 });
+
   const t = useCallback(
     (key: TKey, vars?: Record<string, string | number>) => translate(state.lang, key, vars),
     [state.lang],
   );
 
+  const openDoor = useCallback((doorId: string) => {
+    void openLockerDoorHardware(doorId);
+  }, []);
+
   const actions = useMemo(() => {
     const takenCodes = () => new Set(ref.current.parcels.map((p) => p.code));
+
+    const submitCode = (code: string) => {
+      const matches = ref.current.parcels.filter((p) => p.code === code);
+      const stored = matches.filter((p) => p.status === "stored" && p.doorId);
+      const canOpen = !(ref.current.lockedUntil && Date.now() < ref.current.lockedUntil);
+
+      dispatch({ type: "submitCode", code, now: Date.now() });
+
+      if (canOpen && stored.length > 0) {
+        const doorIds = stored.map((p) => p.doorId!).sort();
+        for (const id of doorIds) openDoor(id);
+      }
+    };
+
+    const staffScan = (tracking?: string) => {
+      const track = tracking ?? randomTracking();
+      const s = ref.current;
+      if (!s.staff) return;
+
+      const nextDoor = findFreeDoor(s, sizeForTracking(track));
+      dispatch({ type: "staffScan", tracking: track });
+      if (nextDoor) openDoor(nextDoor);
+    };
+
+    const staffBigger = () => {
+      const cur = ref.current.staff?.current;
+      if (!ref.current.staff || !cur) return;
+
+      const size = DOOR_BY_ID[cur.doorId].size;
+      const nextSize = SIZES[SIZES.indexOf(size) + 1];
+      if (!nextSize) {
+        dispatch({ type: "staffBigger" });
+        return;
+      }
+
+      const nextDoor = findFreeDoor(ref.current, nextSize, cur.doorId);
+      dispatch({ type: "staffBigger" });
+      if (nextDoor) openDoor(nextDoor);
+    };
+
+    const staffReopen = () => {
+      const curDoor = ref.current.staff?.current?.doorId;
+      dispatch({ type: "staffReopen" });
+      if (curDoor) openDoor(curDoor);
+    };
+
+    const helpRetry = () => {
+      const selectedDoor = ref.current.help.selected;
+      dispatch({ type: "helpRetry" });
+      if (selectedDoor) openDoor(selectedDoor);
+    };
+
     return {
       go: (screen: Screen) => dispatch({ type: "go", screen }),
       setLang: (lang: Lang) => dispatch({ type: "lang", lang }),
       codeDigit: (digit: string) => dispatch({ type: "codeDigit", digit }),
       codeBack: () => dispatch({ type: "codeBack" }),
       codeClear: () => dispatch({ type: "codeClear" }),
-      submitCode: (code: string) => dispatch({ type: "submitCode", code, now: Date.now() }),
+      submitCode,
       unlock: () => dispatch({ type: "unlock" }),
       closeDoor: (doorId: string) => dispatch({ type: "closeDoor", doorId, newCode: randomCode(takenCodes()) }),
       closeAllOpenDoors: () => {
@@ -385,7 +440,7 @@ function useKioskStore() {
       },
       pickupAllTaken: () => dispatch({ type: "pickupAllTaken" }),
       helpSelect: (doorId: string) => dispatch({ type: "helpSelect", doorId }),
-      helpRetry: () => dispatch({ type: "helpRetry" }),
+      helpRetry,
       helpReport: () => dispatch({ type: "helpReport", ticket: randomTicket() }),
       reset: () => dispatch({ type: "reset" }),
       resetDemo: () =>
@@ -398,9 +453,9 @@ function useKioskStore() {
       pinClear: () => dispatch({ type: "pinClear" }),
       submitPin: () => dispatch({ type: "staffLogin", ok: ref.current.pinValue === DEMO.staffPin }),
       staffQrLogin: () => dispatch({ type: "staffLogin", ok: true }),
-      staffScan: (tracking?: string) => dispatch({ type: "staffScan", tracking: tracking ?? randomTracking() }),
-      staffBigger: () => dispatch({ type: "staffBigger" }),
-      staffReopen: () => dispatch({ type: "staffReopen" }),
+      staffScan,
+      staffBigger,
+      staffReopen,
       staffConfirmClosed: () => {
         const cur = ref.current.staff?.current;
         if (cur) dispatch({ type: "closeDoor", doorId: cur.doorId, newCode: randomCode(takenCodes()) });
@@ -413,7 +468,36 @@ function useKioskStore() {
       setDemoOpen: (open: boolean) => dispatch({ type: "demo", open }),
       setSetting: (v: { idleEnabled?: boolean; hideCursor?: boolean }) => dispatch({ type: "setting", ...v }),
     };
-  }, []);
+  }, [openDoor]);
+
+  useEffect(() => {
+    return subscribeHardwareEvents({
+      onScan: (rawCode) => {
+        const clean = rawCode.trim();
+        if (!clean) return;
+
+        const now = Date.now();
+        if (lastScanRef.current.code === clean && now - lastScanRef.current.at < 800) {
+          return;
+        }
+        lastScanRef.current = { code: clean, at: now };
+
+        const cur = ref.current;
+        if (cur.screen === "staffScan") {
+          actions.staffScan(clean);
+        } else if (cur.screen === "code" || cur.screen === "home" || cur.screen === "attract") {
+          const code6 = clean.slice(0, 6);
+          if (cur.screen !== "code") actions.go("code");
+          actions.codeClear();
+          for (const ch of code6) actions.codeDigit(ch);
+          actions.submitCode(code6);
+        }
+      },
+      onDoorClosed: (doorId) => {
+        actions.closeDoor(doorId);
+      },
+    });
+  }, [actions]);
 
   return { state, actions, t, stateRef: ref };
 }
